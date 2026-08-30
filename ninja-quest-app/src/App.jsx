@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useMemo } from "react";
-import { Menu, Trophy, ClipboardList, Package, Flame, CheckCircle2, Sparkles, X } from "lucide-react";
+import { Menu, Trophy, ClipboardList, Package, Flame, CheckCircle2, Sparkles, X, Sliders, Home, Plus, History, Share2 } from "lucide-react";
 
 /* ============================ reference asset notes ============================
    The ninja's look (red headband + trailing tails, black hood/gi, cream face,
@@ -24,9 +24,31 @@ import { Menu, Trophy, ClipboardList, Package, Flame, CheckCircle2, Sparkles, X 
 
 /* ============================ storage ============================ */
 
+// Supabase project config. The anon key is meant to be public -- the actual
+// security comes from the Row Level Security policies on the `saves` table
+// (see supabase_setup.sql), not from hiding this key.
+const SUPABASE_URL = "https://cfuyixkvvtgsntwhgjbn.supabase.co";
+const SUPABASE_ANON_KEY =
+  "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImNmdXlpeGt2dnRnc250d2hnamJuIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODgxMTY0OTYsImV4cCI6MjEwMzY5MjQ5Nn0.8M5yFmsNkq7MAZ89ql6MSR6ixu1bmjWq_yi_2VQ1UtE";
+
+// Loaded via a <script> tag in index.html on the real deployed site (see
+// README notes), never imported directly -- Claude.ai's artifact preview
+// doesn't support arbitrary npm packages, so a static import here would
+// break the in-chat experience. When that script isn't present (i.e. we're
+// running inside Claude.ai), `window.supabase` is simply undefined and the
+// app quietly falls back to its existing window.storage/localStorage path.
+const supabase =
+  typeof window !== "undefined" && window.supabase
+    ? window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY)
+    : null;
+
 const store = {
   async get(key, fallback) {
     try {
+      if (typeof window !== "undefined" && window.storage && window.storage.get) {
+        const r = await window.storage.get(key);
+        return r && r.value ? JSON.parse(r.value) : fallback;
+      }
       const raw = localStorage.getItem(key);
       return raw ? JSON.parse(raw) : fallback;
     } catch (e) {
@@ -35,6 +57,10 @@ const store = {
   },
   async set(key, value) {
     try {
+      if (typeof window !== "undefined" && window.storage && window.storage.set) {
+        await window.storage.set(key, JSON.stringify(value));
+        return true;
+      }
       localStorage.setItem(key, JSON.stringify(value));
       return true;
     } catch (e) {
@@ -81,14 +107,82 @@ const STREAK_STEP = 0.01;
 const STREAK_CAP = 0.4;
 const streakMultiplier = (n) => 1 + Math.min(STREAK_CAP, n * STREAK_STEP);
 
-/* ============================ activity types ============================ */
+/* ============================ activity categories & effort system ============================ */
 
-const ACTIVITIES = {
-  run: { label: "Run", unit: "miles", icon: "🏃", xp: (v) => Math.round(v * 8), placeholder: "3.1" },
-  pushups: { label: "Push-ups", unit: "reps", icon: "💪", xp: (v) => Math.round(v * 1), placeholder: "10" },
-  squats: { label: "Squats", unit: "reps", icon: "🦵", xp: (v) => Math.round(v * 1), placeholder: "15" },
-  plank: { label: "Plank", unit: "seconds", icon: "⏱", xp: (v) => Math.round(v * 0.2), placeholder: "30" },
+// Five-point scales. Baseline is set at onboarding (and revisable anytime);
+// per-log is an optional quick check-in on how a specific log felt. Both are
+// bounded so self-report personalizes XP without being able to dominate it.
+const EFFORT_LABELS = ["Very easy", "Easy", "Moderate", "Hard", "Very hard"];
+const EFFORT_BASELINE_MULT = [0.8, 0.9, 1.0, 1.15, 1.3];
+const PERLOG_LABELS = ["Light breeze", "Comfortable", "Steady", "Tough", "Brutal"];
+const PERLOG_MULT = [0.9, 0.95, 1.0, 1.1, 1.15];
+const EFFORT_MULT_MIN = 0.7;
+const EFFORT_MULT_MAX = 1.4;
+
+function effortMultiplier(baselineRating, perLogRating) {
+  const base = EFFORT_BASELINE_MULT[(baselineRating || 3) - 1];
+  const perLog = perLogRating ? PERLOG_MULT[perLogRating - 1] : 1;
+  return Math.min(EFFORT_MULT_MAX, Math.max(EFFORT_MULT_MIN, base * perLog));
+}
+
+const CATEGORIES = {
+  cardio: {
+    label: "Cardio",
+    stat: "Speed",
+    icon: "🏃",
+    calibrationQ: "How hard does a 1-mile run/jog feel for you right now?",
+    activities: {
+      run: { label: "Run", unit: "miles", icon: "🏃", xp: (v) => Math.round(v * 8), placeholder: "3.1" },
+      walk: { label: "Walk", unit: "miles", icon: "🚶", xp: (v) => Math.round(v * 4), placeholder: "2" },
+      bike: { label: "Bike", unit: "miles", icon: "🚴", xp: (v) => Math.round(v * 3), placeholder: "5" },
+      cardioOther: { label: "Other", unit: "minutes", icon: "✨", xp: (v) => Math.round(v * 1.2), placeholder: "20", isCustom: true },
+    },
+  },
+  strength: {
+    label: "Strength",
+    stat: "Power",
+    icon: "💪",
+    calibrationQ: "How hard do 10 push-ups feel for you right now?",
+    activities: {
+      pushups: { label: "Push-ups", unit: "reps", icon: "💪", xp: (v) => Math.round(v * 1), placeholder: "10" },
+      squats: { label: "Squats", unit: "reps", icon: "🦵", xp: (v) => Math.round(v * 1), placeholder: "15" },
+      weights: { label: "Weights", unit: "minutes", icon: "🏋️", xp: (v) => Math.round(v * 1.5), placeholder: "20" },
+      strengthOther: { label: "Other", unit: "minutes", icon: "✨", xp: (v) => Math.round(v * 1.2), placeholder: "20", isCustom: true },
+    },
+  },
+  habits: {
+    label: "Healthy Habits",
+    stat: "Discipline",
+    icon: "🥗",
+    calibrationQ: "How hard is it for you to stick to healthy habits day-to-day?",
+    activities: {
+      hydration: { label: "Hydration", unit: "glasses", icon: "💧", xp: (v) => Math.round(v * 2), placeholder: "8" },
+      sleep: { label: "Sleep", unit: "hours", icon: "😴", xp: (v) => Math.round(v * 3), placeholder: "8" },
+      meal: { label: "Healthy Meal", unit: "meals", icon: "🥗", xp: (v) => Math.round(v * 8), placeholder: "1" },
+      habitsOther: { label: "Other", unit: "minutes", icon: "✨", xp: (v) => Math.round(v * 1.2), placeholder: "20", isCustom: true },
+    },
+  },
+  recovery: {
+    label: "Recovery",
+    stat: "Focus",
+    icon: "🧘",
+    calibrationQ: "How hard is it for you to make time to stretch or unwind?",
+    activities: {
+      stretch: { label: "Stretching", unit: "minutes", icon: "🤸", xp: (v) => Math.round(v * 1), placeholder: "10" },
+      meditate: { label: "Meditation", unit: "minutes", icon: "🧘", xp: (v) => Math.round(v * 1.2), placeholder: "10" },
+      yoga: { label: "Yoga", unit: "minutes", icon: "🕉", xp: (v) => Math.round(v * 1.5), placeholder: "15" },
+      recoveryOther: { label: "Other", unit: "minutes", icon: "✨", xp: (v) => Math.round(v * 1.2), placeholder: "20", isCustom: true },
+    },
+  },
 };
+
+// Flat lookup so existing code can still do ACTIVITIES[type] without caring
+// which category it's in; each entry also knows its own category key.
+const ACTIVITIES = Object.fromEntries(
+  Object.entries(CATEGORIES).flatMap(([catKey, cat]) =>
+    Object.entries(cat.activities).map(([actKey, act]) => [actKey, { ...act, category: catKey }])
+  )
+);
 
 /* ============================ cosmetics ============================ */
 
@@ -101,9 +195,8 @@ const LOOT = [
   { key: "visor", name: "Night Visor", desc: "A sharper line across the eyes." },
 ];
 
-function rollReward(owned) {
+function rollReward(owned, itemChance = 0.16) {
   const unowned = LOOT.filter((l) => !owned.includes(l.key));
-  const itemChance = 0.16;
   if (unowned.length && Math.random() < itemChance) {
     const item = unowned[Math.floor(Math.random() * unowned.length)];
     return { kind: "item", itemKey: item.key };
@@ -132,6 +225,40 @@ function computeStreak(activities, uptoDate) {
     cursor = addDays(cursor, -1);
   }
   return streak;
+}
+
+// Health: a Tamagotchi-style vitality meter, fully derived (not stored) from
+// how long it's been since the last log. Logging anything snaps it back to
+// full; several days of silence lets it decay. It never erases progress --
+// hitting 0 just softly penalizes XP until the player checks back in.
+const HEALTH_DECAY_PER_DAY = 20;
+function computeHealth(activities, uptoDate) {
+  if (activities.length === 0) return 100;
+  const days = [...new Set(activities.map((a) => a.date))].sort();
+  const lastLogged = new Date(days[days.length - 1] + "T00:00:00");
+  const diffDays = Math.max(0, Math.round((uptoDate - lastLogged) / 86400000));
+  const missedFullDays = Math.max(0, diffDays - 1); // logging yesterday is still "on track" today
+  return Math.max(0, 100 - missedFullDays * HEALTH_DECAY_PER_DAY);
+}
+
+// Average Health: a rolling-window consistency score, worth showing off since
+// a single point-in-time Health reading is nearly always 100 for anyone
+// active (it snaps back the moment you log). Averaging over the last N days
+// (or since account start, if younger than that) actually reveals how
+// consistent someone's been, which is a much better bragging stat.
+const AVG_HEALTH_WINDOW_DAYS = 30;
+function computeAverageHealth(activities, uptoDate) {
+  if (activities.length === 0) return 100;
+  const firstDate = new Date([...new Set(activities.map((a) => a.date))].sort()[0] + "T00:00:00");
+  const daysSinceStart = Math.max(1, Math.round((uptoDate - firstDate) / 86400000) + 1);
+  const windowDays = Math.min(AVG_HEALTH_WINDOW_DAYS, daysSinceStart);
+  let sum = 0;
+  for (let i = 0; i < windowDays; i++) {
+    const day = addDays(uptoDate, -i);
+    const activitiesUpToDay = activities.filter((a) => new Date(a.date + "T00:00:00") <= day);
+    sum += computeHealth(activitiesUpToDay, day);
+  }
+  return Math.round(sum / windowDays);
 }
 
 /* ============================ pixel-art background sprites ============================ */
@@ -625,8 +752,16 @@ const CSS = `
 .nq-glass-card { background:rgba(30,33,54,.82); backdrop-filter:blur(12px); -webkit-backdrop-filter:blur(12px);
   border:2px solid rgba(255,255,255,.14); border-radius:20px; padding:14px 16px; box-shadow:0 10px 28px rgba(0,0,0,.4); }
 .nq-float-level { position:absolute; top:108px; left:16px; right:16px; z-index:5; }
-.nq-float-recent { position:absolute; left:16px; right:16px; bottom:112px; z-index:5; }
-.nq-float-bottom { position:absolute; left:16px; right:16px; bottom:16px; z-index:5; padding:10px 12px 12px; }
+.nq-corner-btn { position:absolute; z-index:6; width:52px; height:52px; border-radius:50%; border:none;
+  background:rgba(30,33,54,.9); color:var(--ink); display:flex; align-items:center; justify-content:center;
+  box-shadow:0 6px 16px rgba(0,0,0,.4); cursor:pointer; transition:transform .15s ease; }
+.nq-corner-btn[data-primary="1"] { background:var(--flame); color:#fff; }
+.nq-badge { position:absolute; top:-2px; right:-2px; background:var(--berry); color:#fff; border-radius:999px;
+  font-size:10px; font-family:'Fredoka',sans-serif; min-width:18px; height:18px; padding:0 4px;
+  display:flex; align-items:center; justify-content:center; }
+.nq-fab-option { position:absolute; z-index:6; width:44px; height:44px; border-radius:50%; border:none;
+  background:rgba(30,33,54,.92); font-size:19px; display:flex; align-items:center; justify-content:center;
+  box-shadow:0 4px 12px rgba(0,0,0,.4); cursor:pointer; animation:nq-fadeUp .18s ease both; }
 
 
 @keyframes nq-pop { 0%{transform:scale(.6);opacity:0;} 65%{transform:scale(1.12);opacity:1;} 100%{transform:scale(1);} }
@@ -980,7 +1115,13 @@ function NinjaScene({ level, streak, flags, size = 50, fill = false }) {
 
 /* ============================ app ============================ */
 
-const DEFAULT_STATE = { activities: [], chestEvents: [], unlockedItems: [] };
+const DEFAULT_STATE = {
+  activities: [],
+  chestEvents: [],
+  unlockedItems: [],
+  onboarded: false,
+  effortBaseline: { cardio: 3, strength: 3, habits: 3, recovery: 3 },
+};
 
 export default function NinjaQuest() {
   const [state, setState] = useState(DEFAULT_STATE);
@@ -988,34 +1129,91 @@ export default function NinjaQuest() {
   const [tab, setTab] = useState("home");
   const [menuOpen, setMenuOpen] = useState(false);
   const [reveal, setReveal] = useState(null);
+  const [logPreset, setLogPreset] = useState(null);
+  // undefined = still checking auth, null = signed out, object = signed in.
+  // Stays null forever when Supabase isn't configured (Claude.ai chat), so
+  // everything below behaves exactly as it did before.
+  const [session, setSession] = useState(supabase ? undefined : null);
 
   useEffect(() => {
-    (async () => {
-      const s = await store.get("ninjaquest:state:v2", null);
-      if (s) setState({ ...DEFAULT_STATE, ...s });
-      setLoaded(true);
-    })();
+    if (!supabase) return;
+    supabase.auth.getSession().then(({ data }) => setSession(data.session));
+    const { data: listener } = supabase.auth.onAuthStateChange((_event, sess) => setSession(sess));
+    return () => listener.subscription.unsubscribe();
   }, []);
 
   useEffect(() => {
-    if (loaded) store.set("ninjaquest:state:v2", state);
-  }, [state, loaded]);
+    if (session === undefined) return; // still checking auth, hold off loading
+    (async () => {
+      if (supabase && session) {
+        const { data } = await supabase.from("saves").select("state").eq("user_id", session.user.id).maybeSingle();
+        if (data && data.state) setState({ ...DEFAULT_STATE, ...data.state });
+        setLoaded(true);
+      } else if (!supabase) {
+        const s = await store.get("ninjaquest:state:v2", null);
+        if (s) setState({ ...DEFAULT_STATE, ...s });
+        setLoaded(true);
+      }
+      // supabase configured but signed out: nothing to load, sign-in screen shows instead
+    })();
+  }, [session]);
+
+  useEffect(() => {
+    if (!loaded) return;
+    if (supabase && session) {
+      supabase.from("saves").upsert({ user_id: session.user.id, state, updated_at: new Date().toISOString() }).then(() => {});
+    } else if (!supabase) {
+      store.set("ninjaquest:state:v2", state);
+    }
+  }, [state, loaded, session]);
 
   const totalXp = useMemo(() => state.activities.reduce((s, a) => s + a.xp, 0), [state.activities]);
   const level = useMemo(() => levelFor(totalXp), [totalXp]);
+  const categoryTotals = useMemo(() => {
+    const totals = { cardio: 0, strength: 0, habits: 0, recovery: 0 };
+    state.activities.forEach((a) => {
+      if (a.category) totals[a.category] = (totals[a.category] || 0) + a.xp;
+    });
+    return totals;
+  }, [state.activities]);
+  const categoryLevels = useMemo(
+    () => Object.fromEntries(Object.entries(categoryTotals).map(([k, v]) => [k, levelFor(v)])),
+    [categoryTotals]
+  );
   const today = new Date();
   today.setHours(0, 0, 0, 0);
   const streak = useMemo(() => computeStreak(state.activities, today), [state.activities]);
+  const health = useMemo(() => computeHealth(state.activities, today), [state.activities]);
+  const avgHealth = useMemo(() => computeAverageHealth(state.activities, today), [state.activities]);
   const pendingChests = state.chestEvents.filter((c) => !c.opened);
 
-  const logActivity = (type, value) => {
-    const base = ACTIVITIES[type].xp(value);
+  const logActivity = (type, value, effortRating, customLabel) => {
+    const activity = ACTIVITIES[type];
+    const category = activity.category;
+    const base = activity.xp(value);
     const streakAfter = computeStreak([...state.activities, { date: todayStr() }], today);
-    const mult = streakMultiplier(streakAfter);
-    const xpEarned = Math.round(base * mult);
+    const streakMult = streakMultiplier(streakAfter);
+    const effortMult = effortMultiplier(state.effortBaseline[category], effortRating);
+
+    // Health penalty: evaluated on the gap *before* this log, so coming
+    // back after a long silence costs a little (deconditioning is real) but
+    // this very log is what restores health to full for everything after it.
+    const healthBefore = computeHealth(state.activities, today);
+    const healthPenalized = healthBefore <= 0;
+    const healthMult = healthPenalized ? 0.75 : 1;
+
+    // Cross-training bonus: a flat bump the first time a category is
+    // touched on a given day, so branching out is rewarded, not just allowed.
+    const todaysCategoriesSoFar = new Set(state.activities.filter((a) => a.date === todayStr()).map((a) => a.category));
+    const crossBonus = todaysCategoriesSoFar.size > 0 && !todaysCategoriesSoFar.has(category) ? 6 : 0;
+
+    const xpEarned = Math.round(base * streakMult * effortMult * healthMult) + crossBonus;
 
     const prevLevel = levelFor(totalXp).level;
-    const newActivities = [...state.activities, { id: Date.now(), date: todayStr(), type, value, xp: xpEarned }];
+    const newActivities = [
+      ...state.activities,
+      { id: Date.now(), date: todayStr(), type, category, value, xp: xpEarned, effortRating: effortRating || null, customLabel: customLabel || null },
+    ];
     const newTotal = totalXp + xpEarned;
     const newLevel = levelFor(newTotal).level;
 
@@ -1024,12 +1222,60 @@ export default function NinjaQuest() {
       newChestEvents.push({ id: `lvl-${l}-${Date.now()}`, kind: "level", level: l, opened: false });
     }
 
-    const workoutReward = rollReward(state.unlockedItems);
+    // Category-weighted loot: nudge the odds for whichever stat is
+    // currently furthest behind, without ever guaranteeing anything.
+    const sortedCats = Object.entries(categoryTotals).sort((a, b) => a[1] - b[1]);
+    const leastTrained = sortedCats[0][0];
+    const isImbalanced = sortedCats[0][1] < sortedCats[sortedCats.length - 1][1];
+    const itemChance = category === leastTrained && isImbalanced ? 0.24 : 0.16;
+    const workoutReward = rollReward(state.unlockedItems, itemChance);
     let unlockedItems = state.unlockedItems;
     if (workoutReward.kind === "item") unlockedItems = [...unlockedItems, workoutReward.itemKey];
 
-    setState({ activities: newActivities, chestEvents: newChestEvents, unlockedItems });
-    setReveal({ kind: "workout", xpEarned, mult, reward: workoutReward, leveledUp: newLevel > prevLevel });
+    // Personal-best day detection for this category (only counts if there's
+    // an actual prior day to beat, so a first-ever log isn't a hollow "PB").
+    const dailyTotalsForCategory = {};
+    newActivities.forEach((a) => {
+      if (a.category === category) dailyTotalsForCategory[a.date] = (dailyTotalsForCategory[a.date] || 0) + a.xp;
+    });
+    const todayCategoryTotal = dailyTotalsForCategory[todayStr()] || 0;
+    const priorBestDay = Math.max(0, ...Object.entries(dailyTotalsForCategory).filter(([d]) => d !== todayStr()).map(([, v]) => v));
+    const personalBest = priorBestDay > 0 && todayCategoryTotal > priorBestDay ? { category } : null;
+
+    // Recalibration nudge: if the last 8 ratings in this category average
+    // "easy" while the baseline still says otherwise, suggest lowering it.
+    const recentRatings = newActivities
+      .filter((a) => a.category === category && a.effortRating)
+      .slice(-8)
+      .map((a) => a.effortRating);
+    let recalibrate = null;
+    if (recentRatings.length >= 8) {
+      const avg = recentRatings.reduce((s, r) => s + r, 0) / recentRatings.length;
+      if (avg <= 2 && state.effortBaseline[category] >= 3) {
+        recalibrate = { category, suggested: state.effortBaseline[category] - 1 };
+      }
+    }
+
+    setState({ ...state, activities: newActivities, chestEvents: newChestEvents, unlockedItems });
+    setReveal({
+      kind: "workout",
+      xpEarned,
+      mult: streakMult,
+      crossBonus,
+      personalBest,
+      healthPenalized,
+      reward: workoutReward,
+      leveledUp: newLevel > prevLevel,
+      recalibrate,
+    });
+  };
+
+  const setEffortBaseline = (category, rating) => {
+    setState((prev) => ({ ...prev, effortBaseline: { ...prev.effortBaseline, [category]: rating } }));
+  };
+
+  const completeOnboarding = (baseline) => {
+    setState((prev) => ({ ...prev, onboarded: true, effortBaseline: baseline }));
   };
 
   const openLevelChest = (chestId) => {
@@ -1044,6 +1290,19 @@ export default function NinjaQuest() {
     setReveal({ kind: "level", reward });
   };
 
+  if (supabase && (session === undefined || session === null)) {
+    return (
+      <div className="nq">
+        <style>{CSS}</style>
+        <div className="nq-phone">
+          <div className="nq-wrap">
+            {session === undefined ? <p className="nq-empty">Checking your account…</p> : <SignInScreen />}
+          </div>
+        </div>
+      </div>
+    );
+  }
+
   if (!loaded) {
     return (
       <div className="nq">
@@ -1057,13 +1316,32 @@ export default function NinjaQuest() {
     );
   }
 
+  if (!state.onboarded) {
+    return (
+      <div className="nq">
+        <style>{CSS}</style>
+        <div className="nq-phone">
+          <div className="nq-wrap">
+            <Onboarding onComplete={completeOnboarding} />
+          </div>
+        </div>
+      </div>
+    );
+  }
+
   return (
     <div className="nq">
       <style>{CSS}</style>
       <div className="nq-phone">
         <div className="nq-wrap" data-fullscreen={tab === "home" ? "1" : "0"}>
         <div className="nq-topbar">
-          <div className="nq-menu-wrap">
+          <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+            {tab !== "home" && (
+              <button className="nq-icon-btn" onClick={() => setTab("home")} aria-label="Back to Home">
+                <Home size={20} />
+              </button>
+            )}
+            <div className="nq-menu-wrap">
             <button className="nq-icon-btn" onClick={() => setMenuOpen((v) => !v)} aria-label="Menu">
               <Menu size={20} />
             </button>
@@ -1076,6 +1354,8 @@ export default function NinjaQuest() {
                     ["log", "Log activity", ClipboardList],
                     ["chests", `Chests${pendingChests.length ? ` (${pendingChests.length})` : ""}`, Trophy],
                     ["inventory", "Inventory", Package],
+                    ["effort", "Effort settings", Sliders],
+                    ["share", "Share progress", Share2],
                   ].map(([k, label, Icon]) => (
                     <button
                       key={k}
@@ -1093,6 +1373,7 @@ export default function NinjaQuest() {
                 </div>
               </>
             )}
+            </div>
           </div>
           <div className="nq-chip">
             <div className="nq-chip-v nq-num" style={{ color: "var(--flame-d)" }}>
@@ -1116,14 +1397,29 @@ export default function NinjaQuest() {
           </div>
         </div>
 
-        {reveal && <RewardModal reveal={reveal} onClose={() => setReveal(null)} />}
+        {reveal && <RewardModal reveal={reveal} onClose={() => setReveal(null)} onRecalibrate={setEffortBaseline} />}
 
         {tab === "home" && (
-          <HomeView level={level} streak={streak} flags={state.unlockedItems} totalXp={totalXp} activities={state.activities} setTab={setTab} />
+          <HomeView
+            level={level}
+            streak={streak}
+            health={health}
+            flags={state.unlockedItems}
+            totalXp={totalXp}
+            activities={state.activities}
+            categoryLevels={categoryLevels}
+            setTab={setTab}
+            onQuickLog={(category) => {
+              setLogPreset(category);
+              setTab("log");
+            }}
+          />
         )}
-        {tab === "log" && <LogView onLog={logActivity} />}
+        {tab === "log" && <LogView onLog={logActivity} initialCategory={logPreset} />}
         {tab === "chests" && <ChestsView chestEvents={state.chestEvents} onOpen={openLevelChest} />}
         {tab === "inventory" && <InventoryView unlockedItems={state.unlockedItems} level={level} streak={streak} />}
+        {tab === "effort" && <EffortSettings baseline={state.effortBaseline} onSave={setEffortBaseline} />}
+        {tab === "share" && <ShareCard level={level} avgHealth={avgHealth} streak={streak} />}
         </div>
       </div>
     </div>
@@ -1132,7 +1428,7 @@ export default function NinjaQuest() {
 
 /* ============================ reward modal ============================ */
 
-function RewardModal({ reveal, onClose }) {
+function RewardModal({ reveal, onClose, onRecalibrate }) {
   const item = reveal.reward.kind === "item" ? LOOT.find((l) => l.key === reveal.reward.itemKey) : null;
   return (
     <div
@@ -1149,6 +1445,19 @@ function RewardModal({ reveal, onClose }) {
             <>
               <div className="nq-reveal-title">+{reveal.xpEarned} XP</div>
               {reveal.mult > 1 && <div className="nq-reveal-sub">×{reveal.mult.toFixed(2)} streak bonus included</div>}
+              {reveal.crossBonus > 0 && (
+                <div className="nq-reveal-sub">+{reveal.crossBonus} XP for mixing it up today</div>
+              )}
+              {reveal.healthPenalized && (
+                <div className="nq-reveal-sub" style={{ color: "var(--berry)" }}>
+                  −25% XP — your health ran out, but you're back now and it's full again
+                </div>
+              )}
+              {reveal.personalBest && (
+                <p className="nq-cheer" style={{ marginTop: 10 }}>
+                  New personal best day for {CATEGORIES[reveal.personalBest.category].stat}! 🔥
+                </p>
+              )}
               {reveal.leveledUp && <p className="nq-cheer" style={{ marginTop: 10 }}>Level up! A chest is waiting for you.</p>}
             </>
           )}
@@ -1165,91 +1474,395 @@ function RewardModal({ reveal, onClose }) {
               </>
             )
           )}
-          <button className="nq-btn" data-primary="1" onClick={onClose} style={{ marginTop: 16 }}>
-            Nice
-          </button>
+          {reveal.recalibrate && (
+            <div className="nq-cheer" style={{ marginTop: 10, textAlign: "left" }}>
+              <div style={{ marginBottom: 8 }}>
+                {CATEGORIES[reveal.recalibrate.category].label} has felt easy lately — lower your baseline?
+              </div>
+              <div style={{ display: "flex", gap: 8 }}>
+                <button
+                  className="nq-btn"
+                  style={{ flex: 1, padding: "8px 10px", fontSize: 13 }}
+                  onClick={() => {
+                    onRecalibrate(reveal.recalibrate.category, reveal.recalibrate.suggested);
+                    onClose();
+                  }}
+                >
+                  Lower it
+                </button>
+                <button className="nq-btn" style={{ flex: 1, padding: "8px 10px", fontSize: 13 }} onClick={onClose}>
+                  Keep as is
+                </button>
+              </div>
+            </div>
+          )}
+          {!reveal.recalibrate && (
+            <button className="nq-btn" data-primary="1" onClick={onClose} style={{ marginTop: 16 }}>
+              Nice
+            </button>
+          )}
         </div>
       </div>
+    </div>
+  );
+}
+
+/* ============================ effort calibration ============================ */
+
+function EffortPickerRow({ value, onChange, labels }) {
+  return (
+    <div style={{ display: "flex", gap: 6 }}>
+      {labels.map((label, i) => {
+        const rating = i + 1;
+        const on = value === rating;
+        return (
+          <button
+            key={rating}
+            onClick={() => onChange(rating)}
+            className="nq-btn"
+            style={{
+              flex: 1, padding: "8px 4px", fontSize: 11, lineHeight: 1.2,
+              background: on ? "var(--sky)" : "var(--card)",
+              borderColor: on ? "var(--sky)" : "var(--line)",
+              color: on ? "#fff" : "var(--ink)",
+            }}
+          >
+            {label}
+          </button>
+        );
+      })}
+    </div>
+  );
+}
+
+function SignInScreen() {
+  const [email, setEmail] = useState("");
+  const [sent, setSent] = useState(false);
+  const [error, setError] = useState("");
+  const [sending, setSending] = useState(false);
+
+  const sendLink = async () => {
+    if (!email.trim()) return;
+    setSending(true);
+    setError("");
+    const { error } = await supabase.auth.signInWithOtp({
+      email: email.trim(),
+      options: { emailRedirectTo: window.location.origin },
+    });
+    setSending(false);
+    if (error) setError(error.message);
+    else setSent(true);
+  };
+
+  return (
+    <div className="nq-card" style={{ marginTop: 18 }}>
+      <div className="nq-disp" style={{ fontSize: 20, marginBottom: 6 }}>Welcome, ninja</div>
+      {sent ? (
+        <p className="nq-note" style={{ lineHeight: 1.5 }}>
+          Check <strong>{email}</strong> for a sign-in link. Tap it on this device to jump back in — your
+          progress will be waiting for you here and on any device you sign into.
+        </p>
+      ) : (
+        <>
+          <p className="nq-note" style={{ marginBottom: 14, lineHeight: 1.5 }}>
+            Enter your email and we'll send a link — no password to remember. Your progress saves to your
+            account, not just this browser.
+          </p>
+          <label className="nq-field">
+            <span className="nq-label">Email</span>
+            <input
+              className="nq-input"
+              type="email"
+              value={email}
+              onChange={(e) => setEmail(e.target.value)}
+              placeholder="you@example.com"
+              onKeyDown={(e) => e.key === "Enter" && sendLink()}
+            />
+          </label>
+          {error && <p className="nq-note" style={{ color: "var(--berry)", marginBottom: 10 }}>{error}</p>}
+          <button className="nq-btn" data-primary="1" onClick={sendLink} disabled={!email.trim() || sending} style={{ width: "100%" }}>
+            {sending ? "Sending…" : "Send sign-in link"}
+          </button>
+        </>
+      )}
+    </div>
+  );
+}
+
+function Onboarding({ onComplete }) {
+  const [answers, setAnswers] = useState({ cardio: 3, strength: 3, habits: 3, recovery: 3 });
+  return (
+    <div className="nq-card" style={{ marginTop: 18 }}>
+      <div className="nq-disp" style={{ fontSize: 20, marginBottom: 6 }}>Before we start…</div>
+      <p className="nq-note" style={{ marginBottom: 16, lineHeight: 1.5 }}>
+        Everyone's starting point is different — a run that's easy for one person can be brutal for
+        another. Answer as honestly as you can; this just makes sure the game rewards <em>your</em>{" "}
+        effort fairly. You can change these anytime in Effort settings.
+      </p>
+      {Object.entries(CATEGORIES).map(([key, cat]) => (
+        <div key={key} style={{ marginBottom: 16 }}>
+          <div className="nq-label" style={{ marginBottom: 6 }}>{cat.icon} {cat.calibrationQ}</div>
+          <EffortPickerRow value={answers[key]} onChange={(r) => setAnswers((a) => ({ ...a, [key]: r }))} labels={EFFORT_LABELS} />
+        </div>
+      ))}
+      <button className="nq-btn" data-primary="1" onClick={() => onComplete(answers)} style={{ width: "100%", marginTop: 4 }}>
+        Let's go
+      </button>
+    </div>
+  );
+}
+
+function EffortSettings({ baseline, onSave }) {
+  return (
+    <div className="nq-card">
+      <div className="nq-eyebrow" style={{ marginBottom: 10 }}>Effort settings</div>
+      <p className="nq-note" style={{ marginBottom: 16, lineHeight: 1.5 }}>
+        Adjust how hard each category feels for you right now. As you get fitter, things that used to
+        feel hard may feel easier — update these whenever that's true.
+      </p>
+      {Object.entries(CATEGORIES).map(([key, cat]) => (
+        <div key={key} style={{ marginBottom: 16 }}>
+          <div className="nq-label" style={{ marginBottom: 6 }}>{cat.icon} {cat.label}</div>
+          <EffortPickerRow value={baseline[key]} onChange={(r) => onSave(key, r)} labels={EFFORT_LABELS} />
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function ShareCard({ level, avgHealth, streak }) {
+  const [copied, setCopied] = useState(false);
+  const shareText = `I'm Level ${level.level} (${level.tier.name}) in Ninja Quest — ${avgHealth}% average health over the last 30 days and a ${streak}-day streak. 🥷`;
+
+  const share = async () => {
+    if (navigator.share) {
+      try {
+        await navigator.share({ text: shareText });
+      } catch (e) {
+        // user cancelled the share sheet — nothing to do
+      }
+    } else {
+      try {
+        await navigator.clipboard.writeText(shareText);
+        setCopied(true);
+        setTimeout(() => setCopied(false), 2000);
+      } catch (e) {
+        // clipboard unavailable — the text is still visible below to copy manually
+      }
+    }
+  };
+
+  return (
+    <div className="nq-card">
+      <div className="nq-eyebrow" style={{ marginBottom: 12 }}>Share progress</div>
+      <div
+        className="nq-glass-card"
+        style={{ background: "var(--card)", border: "2px solid var(--line)", textAlign: "center", padding: "24px 16px", marginBottom: 16 }}
+      >
+        <div className="nq-num" style={{ fontSize: 12, color: "var(--dim)", marginBottom: 4 }}>LEVEL</div>
+        <div className="nq-disp" style={{ fontSize: 42, lineHeight: 1 }}>{level.level}</div>
+        <span className="nq-pill" style={{ background: level.tier.color, marginTop: 6, display: "inline-block" }}>
+          {level.tier.name}
+        </span>
+        <div style={{ display: "flex", justifyContent: "center", gap: 24, marginTop: 18 }}>
+          <div>
+            <div className="nq-disp" style={{ fontSize: 22, color: "var(--grass-d)" }}>{avgHealth}%</div>
+            <div className="nq-note" style={{ fontSize: 10 }}>Avg Health (30d)</div>
+          </div>
+          <div>
+            <div className="nq-disp" style={{ fontSize: 22, color: "var(--flame-d)" }}>{streak}</div>
+            <div className="nq-note" style={{ fontSize: 10 }}>Day streak</div>
+          </div>
+        </div>
+      </div>
+      <button className="nq-btn" data-primary="1" onClick={share} style={{ width: "100%" }}>
+        {copied ? "Copied to clipboard!" : "Share with a friend"}
+      </button>
     </div>
   );
 }
 
 /* ============================ home ============================ */
 
-function HomeView({ level, streak, flags, totalXp, activities, setTab }) {
-  const recent = [...activities].sort((a, b) => b.id - a.id)[0];
+function HomeView({ level, streak, health, flags, totalXp, activities, categoryLevels, setTab, onQuickLog }) {
+  const [fabOpen, setFabOpen] = useState(false);
+  const [historyOpen, setHistoryOpen] = useState(false);
+  const todayActs = activities.filter((a) => a.date === todayStr()).sort((a, b) => b.id - a.id);
+  const todayXp = todayActs.reduce((s, a) => s + a.xp, 0);
+  const healthColor = health <= 0 ? "var(--berry)" : health < 50 ? "var(--flame)" : "var(--grass)";
+
   return (
     <div className="nq-home-fill">
       <NinjaScene level={level} streak={streak} flags={flags} size={100} fill />
 
-      <div className="nq-float-level nq-glass-card">
-        <div className="nq-level" style={{ gap: 12 }}>
-          <div className="nq-level-lvlwrap">
-            <span className="nq-level-lvl">Lvl</span>
-            <div className="nq-level-n" style={{ fontSize: 38 }}>{level.level}</div>
-          </div>
-          <div className="nq-level-side">
-            <span className="nq-pill" style={{ background: level.tier.color }}>{level.tier.name}</span>
-            <div className="nq-note nq-num" style={{ marginTop: 5 }}>
-              {totalXp} XP total · {level.span - level.into} to level {level.level + 1}
+      <div className="nq-float-level nq-glass-card" style={{ padding: "10px 14px" }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+          <div className="nq-level-n" style={{ fontSize: 26, lineHeight: 1 }}>{level.level}</div>
+          <div style={{ flex: 1 }}>
+            <div className="nq-note nq-num" style={{ fontSize: 11 }}>
+              {totalXp} XP · {level.span - level.into} to next level
             </div>
-            <div className="nq-track">
+            <div className="nq-track" style={{ height: 6, marginTop: 3 }}>
               <i style={{ width: `${level.pct}%`, background: level.tier.color }} />
             </div>
           </div>
         </div>
+
+        <div style={{ marginTop: 8 }}>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline" }}>
+            <span className="nq-note" style={{ fontSize: 10 }}>Health</span>
+            <span className="nq-num" style={{ fontSize: 10, color: healthColor, fontFamily: "'Fredoka',sans-serif" }}>
+              {health}/100
+            </span>
+          </div>
+          <div className="nq-track" style={{ height: 6, marginTop: 2 }}>
+            <i style={{ width: `${health}%`, background: healthColor }} />
+          </div>
+          {health <= 0 && (
+            <div className="nq-note" style={{ fontSize: 10, color: "var(--berry)", marginTop: 2 }}>
+              Depleted — log something to bring it back
+            </div>
+          )}
+        </div>
+
+        {categoryLevels && (
+          <div style={{ display: "flex", gap: 6, marginTop: 8 }}>
+            {Object.entries(CATEGORIES).map(([key, cat]) => (
+              <div key={key} style={{ flex: 1, textAlign: "center" }}>
+                <div style={{ fontSize: 11 }}>{cat.icon}</div>
+                <div className="nq-num" style={{ fontSize: 10, fontFamily: "'Fredoka',sans-serif" }}>
+                  Lv {categoryLevels[key].level}
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
       </div>
 
-      {recent && (
-        <div className="nq-float-recent nq-glass-card">
-          <div className="nq-row" style={{ padding: 0, border: "none" }}>
-            <span style={{ fontSize: 20 }}>{ACTIVITIES[recent.type].icon}</span>
-            <div style={{ flex: 1 }}>
-              <div className="nq-num" style={{ fontSize: 14 }}>
-                {recent.value} {ACTIVITIES[recent.type].unit} · {ACTIVITIES[recent.type].label}
-              </div>
-              <div className="nq-note">{recent.date}</div>
-            </div>
-            <span className="nq-num" style={{ color: "var(--coin-d)", fontFamily: "'Fredoka',sans-serif" }}>+{recent.xp}</span>
-          </div>
-        </div>
+      {(fabOpen || historyOpen) && (
+        <div
+          style={{ position: "absolute", inset: 0, zIndex: 5 }}
+          onClick={() => {
+            setFabOpen(false);
+            setHistoryOpen(false);
+          }}
+        />
       )}
 
-      <div className="nq-float-bottom nq-glass-card">
-        <div className="nq-eyebrow" style={{ marginBottom: 6, fontSize: 9.5 }}>Quick log</div>
-        <div className="nq-actgrid-compact">
-          {Object.entries(ACTIVITIES).map(([key, a]) => (
-            <div key={key} className="nq-actbtn nq-actbtn-compact" onClick={() => setTab("log")}>
-              <div className="nq-actbtn-i">{a.icon}</div>
-              <div className="nq-actbtn-l">{a.label}</div>
+      {historyOpen && (
+        <div className="nq-glass-card" style={{ position: "absolute", left: 16, right: 16, bottom: 84, zIndex: 6, maxHeight: "48%", overflowY: "auto" }}>
+          <div className="nq-eyebrow" style={{ marginBottom: 8 }}>
+            Today · {todayActs.length} logged · +{todayXp} XP
+          </div>
+          {todayActs.length === 0 && <p className="nq-empty">Nothing logged yet today.</p>}
+          {todayActs.map((a) => (
+            <div key={a.id} className="nq-row">
+              <span style={{ fontSize: 18 }}>{ACTIVITIES[a.type].icon}</span>
+              <div style={{ flex: 1 }}>
+                <div className="nq-num" style={{ fontSize: 13 }}>
+                  {a.value} {ACTIVITIES[a.type].unit} · {a.customLabel || ACTIVITIES[a.type].label}
+                </div>
+                <div className="nq-note" style={{ fontSize: 10.5 }}>
+                  +{a.xp} XP → {CATEGORIES[a.category].stat} & Level
+                </div>
+              </div>
             </div>
           ))}
         </div>
-      </div>
+      )}
+
+      <button
+        className="nq-corner-btn"
+        style={{ left: 16, bottom: 16 }}
+        onClick={() => {
+          setHistoryOpen((v) => !v);
+          setFabOpen(false);
+        }}
+        aria-label="History"
+      >
+        <History size={20} />
+        {todayActs.length > 0 && <span className="nq-badge">{todayActs.length}</span>}
+      </button>
+
+      {fabOpen &&
+        Object.entries(CATEGORIES).map(([key, cat], i) => (
+          <button
+            key={key}
+            className="nq-fab-option"
+            style={{ right: 16, bottom: 16 + (i + 1) * 58 }}
+            onClick={() => {
+              setFabOpen(false);
+              onQuickLog(key);
+            }}
+            aria-label={cat.label}
+          >
+            {cat.icon}
+          </button>
+        ))}
+
+      <button
+        className="nq-corner-btn"
+        data-primary="1"
+        style={{ right: 16, bottom: 16, transform: fabOpen ? "rotate(45deg)" : "rotate(0deg)" }}
+        onClick={() => {
+          setFabOpen((v) => !v);
+          setHistoryOpen(false);
+        }}
+        aria-label="Log an activity"
+      >
+        <Plus size={24} />
+      </button>
     </div>
   );
 }
 
 /* ============================ log ============================ */
 
-function LogView({ onLog }) {
-  const [type, setType] = useState("run");
+function LogView({ onLog, initialCategory }) {
+  const [category, setCategory] = useState(initialCategory || "cardio");
+  const [type, setType] = useState(Object.keys(CATEGORIES[initialCategory || "cardio"].activities)[0]);
   const [value, setValue] = useState("");
+  const [customLabel, setCustomLabel] = useState("");
+  const [effortRating, setEffortRating] = useState(null);
   const a = ACTIVITIES[type];
   const preview = value ? a.xp(parseFloat(value) || 0) : 0;
+
+  const pickCategory = (key) => {
+    setCategory(key);
+    setType(Object.keys(CATEGORIES[key].activities)[0]);
+    setCustomLabel("");
+  };
 
   const submit = () => {
     const v = parseFloat(value);
     if (!v || v <= 0) return;
-    onLog(type, v);
+    if (a.isCustom && !customLabel.trim()) return;
+    onLog(type, v, effortRating, a.isCustom ? customLabel.trim() : null);
     setValue("");
+    setCustomLabel("");
+    setEffortRating(null);
   };
 
   return (
     <div className="nq-card">
+      <div className="nq-eyebrow" style={{ marginBottom: 12 }}>Category</div>
+      <div className="nq-actgrid" style={{ marginBottom: 16 }}>
+        {Object.entries(CATEGORIES).map(([key, cat]) => (
+          <div
+            key={key}
+            className="nq-actbtn"
+            style={category === key ? { borderColor: "var(--sky)", background: "#1E2E3D" } : undefined}
+            onClick={() => pickCategory(key)}
+          >
+            <div className="nq-actbtn-i">{cat.icon}</div>
+            <div className="nq-actbtn-l">{cat.label}</div>
+          </div>
+        ))}
+      </div>
+
       <div className="nq-eyebrow" style={{ marginBottom: 12 }}>What did you do?</div>
       <div className="nq-actgrid" style={{ marginBottom: 16 }}>
-        {Object.entries(ACTIVITIES).map(([key, act]) => (
+        {Object.entries(CATEGORIES[category].activities).map(([key, act]) => (
           <div
             key={key}
             className="nq-actbtn"
@@ -1261,6 +1874,18 @@ function LogView({ onLog }) {
           </div>
         ))}
       </div>
+
+      {a.isCustom && (
+        <label className="nq-field">
+          <span className="nq-label">What was it?</span>
+          <input
+            className="nq-input"
+            value={customLabel}
+            onChange={(e) => setCustomLabel(e.target.value)}
+            placeholder="Rowing, climbing, dance class…"
+          />
+        </label>
+      )}
 
       <label className="nq-field">
         <span className="nq-label">{a.label} — {a.unit}</span>
@@ -1274,12 +1899,19 @@ function LogView({ onLog }) {
       </label>
 
       {value && (
-        <p className="nq-note" style={{ marginBottom: 14 }}>
-          Roughly <span className="nq-num" style={{ color: "var(--coin-d)" }}>+{preview} XP</span>, plus your current streak bonus.
-        </p>
+        <>
+          <p className="nq-note" style={{ marginBottom: 10 }}>
+            Roughly <span className="nq-num" style={{ color: "var(--coin-d)" }}>+{preview} XP</span> before your streak
+            and effort bonuses.
+          </p>
+          <div className="nq-field">
+            <span className="nq-label">How did it feel? (optional)</span>
+            <EffortPickerRow value={effortRating} onChange={setEffortRating} labels={PERLOG_LABELS} />
+          </div>
+        </>
       )}
 
-      <button className="nq-btn" data-primary="1" onClick={submit} disabled={!value}>
+      <button className="nq-btn" data-primary="1" onClick={submit} disabled={!value || (a.isCustom && !customLabel.trim())}>
         Log it
       </button>
     </div>
