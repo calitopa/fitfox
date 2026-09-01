@@ -176,6 +176,32 @@ const CATEGORIES = {
   },
 };
 
+// Trials: a milestone challenge unlocked every 5 levels, themed around one
+// category at a time (cycling through all four so it stays fair). No enemy,
+// no penalty for missing the deadline -- purely a bigger, nearer goal than
+// the infinite level curve, per the "no punishing losses" principle.
+const TRIAL_NAMES = {
+  cardio: "The Endurance Trial",
+  strength: "The Power Trial",
+  habits: "The Discipline Trial",
+  recovery: "The Focus Trial",
+};
+const TRIAL_CATEGORY_ORDER = ["cardio", "strength", "habits", "recovery"];
+const TRIAL_WINDOW_DAYS = 12;
+
+function makeTrial(milestoneLevel, trialsCompleted, categoryTotals, today) {
+  const category = TRIAL_CATEGORY_ORDER[trialsCompleted % TRIAL_CATEGORY_ORDER.length];
+  const target = 60 + (milestoneLevel / 5 - 1) * 20;
+  return {
+    id: `trial-${milestoneLevel}-${Date.now()}`,
+    category,
+    target,
+    milestoneLevel,
+    startCategoryXp: categoryTotals[category] || 0,
+    deadline: fmtDate(addDays(today, TRIAL_WINDOW_DAYS)),
+  };
+}
+
 // Flat lookup so existing code can still do ACTIVITIES[type] without caring
 // which category it's in; each entry also knows its own category key.
 const ACTIVITIES = Object.fromEntries(
@@ -752,6 +778,7 @@ const CSS = `
 .nq-glass-card { background:rgba(30,33,54,.82); backdrop-filter:blur(12px); -webkit-backdrop-filter:blur(12px);
   border:2px solid rgba(255,255,255,.14); border-radius:20px; padding:14px 16px; box-shadow:0 10px 28px rgba(0,0,0,.4); }
 .nq-float-level { position:absolute; top:108px; left:16px; right:16px; z-index:5; }
+.nq-float-trial { position:absolute; top:266px; left:16px; right:16px; z-index:5; }
 .nq-corner-btn { position:absolute; z-index:6; width:52px; height:52px; border-radius:50%; border:none;
   background:rgba(30,33,54,.9); color:var(--ink); display:flex; align-items:center; justify-content:center;
   box-shadow:0 6px 16px rgba(0,0,0,.4); cursor:pointer; transition:transform .15s ease; }
@@ -1121,6 +1148,8 @@ const DEFAULT_STATE = {
   unlockedItems: [],
   onboarded: false,
   effortBaseline: { cardio: 3, strength: 3, habits: 3, recovery: 3 },
+  trial: null,
+  trialsCompleted: 0,
 };
 
 export default function NinjaQuest() {
@@ -1185,6 +1214,14 @@ export default function NinjaQuest() {
   const streak = useMemo(() => computeStreak(state.activities, today), [state.activities]);
   const health = useMemo(() => computeHealth(state.activities, today), [state.activities]);
   const avgHealth = useMemo(() => computeAverageHealth(state.activities, today), [state.activities]);
+  const trialStatus = useMemo(() => {
+    if (!state.trial) return null;
+    const progress = Math.max(0, (categoryTotals[state.trial.category] || 0) - state.trial.startCategoryXp);
+    const ready = progress >= state.trial.target;
+    const expired = !ready && todayStr() > state.trial.deadline;
+    const daysLeft = Math.max(0, Math.ceil((new Date(state.trial.deadline + "T00:00:00") - today) / 86400000));
+    return { progress, ready, expired, daysLeft };
+  }, [state.trial, categoryTotals, today]);
   const pendingChests = state.chestEvents.filter((c) => !c.opened);
 
   const logActivity = (type, value, effortRating, customLabel) => {
@@ -1222,6 +1259,19 @@ export default function NinjaQuest() {
       newChestEvents.push({ id: `lvl-${l}-${Date.now()}`, kind: "level", level: l, opened: false });
     }
 
+    // Trigger a new Trial the first time we cross a multiple-of-5 level,
+    // as long as one isn't already active.
+    const newCategoryTotals = { ...categoryTotals, [category]: (categoryTotals[category] || 0) + xpEarned };
+    let newTrial = state.trial;
+    if (!newTrial) {
+      for (let l = prevLevel + 1; l <= newLevel; l++) {
+        if (l % 5 === 0) {
+          newTrial = makeTrial(l, state.trialsCompleted, newCategoryTotals, today);
+          break;
+        }
+      }
+    }
+
     // Category-weighted loot: nudge the odds for whichever stat is
     // currently furthest behind, without ever guaranteeing anything.
     const sortedCats = Object.entries(categoryTotals).sort((a, b) => a[1] - b[1]);
@@ -1256,7 +1306,8 @@ export default function NinjaQuest() {
       }
     }
 
-    setState({ ...state, activities: newActivities, chestEvents: newChestEvents, unlockedItems });
+    const trialJustUnlocked = newTrial && newTrial !== state.trial;
+    setState({ ...state, activities: newActivities, chestEvents: newChestEvents, unlockedItems, trial: newTrial });
     setReveal({
       kind: "workout",
       xpEarned,
@@ -1267,7 +1318,33 @@ export default function NinjaQuest() {
       reward: workoutReward,
       leveledUp: newLevel > prevLevel,
       recalibrate,
+      trialUnlocked: trialJustUnlocked ? newTrial : null,
     });
+  };
+
+  const claimTrial = () => {
+    if (!state.trial) return;
+    const unowned = LOOT.filter((l) => !state.unlockedItems.includes(l.key));
+    let reward, unlockedItems = state.unlockedItems;
+    if (unowned.length) {
+      const item = unowned[Math.floor(Math.random() * unowned.length)];
+      reward = { kind: "item", itemKey: item.key };
+      unlockedItems = [...unlockedItems, item.key];
+    } else {
+      reward = { kind: "xp", amount: 40 };
+    }
+    setState((prev) => ({
+      ...prev,
+      unlockedItems,
+      trialsCompleted: prev.trialsCompleted + 1,
+      trial: null,
+      activities: reward.kind === "xp" ? [...prev.activities, { id: Date.now(), date: todayStr(), type: "trialReward", category: state.trial.category, value: 0, xp: reward.amount, effortRating: null, customLabel: "Trial reward" }] : prev.activities,
+    }));
+    setReveal({ kind: "trial", reward });
+  };
+
+  const dismissTrial = () => {
+    setState((prev) => ({ ...prev, trial: null }));
   };
 
   const setEffortBaseline = (category, rating) => {
@@ -1409,6 +1486,10 @@ export default function NinjaQuest() {
             activities={state.activities}
             categoryLevels={categoryLevels}
             setTab={setTab}
+            trial={state.trial}
+            trialStatus={trialStatus}
+            onClaimTrial={claimTrial}
+            onDismissTrial={dismissTrial}
             onQuickLog={(category) => {
               setLogPreset(category);
               setTab("log");
@@ -1440,7 +1521,8 @@ function RewardModal({ reveal, onClose, onRecalibrate }) {
     >
       <div className="nq-card" style={{ maxWidth: 320, width: "100%", marginBottom: 0 }} onClick={(e) => e.stopPropagation()}>
         <div className="nq-reveal">
-          <div className="nq-reveal-icon">{item ? "🎁" : reveal.kind === "level" ? "🏆" : "✨"}</div>
+          <div className="nq-reveal-icon">{reveal.kind === "trial" ? "🏅" : item ? "🎁" : reveal.kind === "level" ? "🏆" : "✨"}</div>
+          {reveal.kind === "trial" && <div className="nq-reveal-title">Trial complete!</div>}
           {reveal.kind === "workout" && (
             <>
               <div className="nq-reveal-title">+{reveal.xpEarned} XP</div>
@@ -1458,6 +1540,12 @@ function RewardModal({ reveal, onClose, onRecalibrate }) {
                   New personal best day for {CATEGORIES[reveal.personalBest.category].stat}! 🔥
                 </p>
               )}
+              {reveal.trialUnlocked && (
+                <p className="nq-cheer" style={{ marginTop: 10 }}>
+                  {TRIAL_NAMES[reveal.trialUnlocked.category]} unlocked! Earn {reveal.trialUnlocked.target}{" "}
+                  {CATEGORIES[reveal.trialUnlocked.category].stat} XP within {TRIAL_WINDOW_DAYS} days.
+                </p>
+              )}
               {reveal.leveledUp && <p className="nq-cheer" style={{ marginTop: 10 }}>Level up! A chest is waiting for you.</p>}
             </>
           )}
@@ -1467,7 +1555,7 @@ function RewardModal({ reveal, onClose, onRecalibrate }) {
               <div className="nq-reveal-sub">{item.desc}</div>
             </>
           ) : (
-            reveal.kind === "level" && (
+            (reveal.kind === "level" || reveal.kind === "trial") && (
               <>
                 <div className="nq-reveal-title">+{reveal.reward.amount} bonus XP</div>
                 <div className="nq-reveal-sub">Every cosmetic is already yours — nice work.</div>
@@ -1684,7 +1772,7 @@ function ShareCard({ level, avgHealth, streak }) {
 
 /* ============================ home ============================ */
 
-function HomeView({ level, streak, health, flags, totalXp, activities, categoryLevels, setTab, onQuickLog }) {
+function HomeView({ level, streak, health, flags, totalXp, activities, categoryLevels, setTab, trial, trialStatus, onClaimTrial, onDismissTrial, onQuickLog }) {
   const [fabOpen, setFabOpen] = useState(false);
   const [historyOpen, setHistoryOpen] = useState(false);
   const todayActs = activities.filter((a) => a.date === todayStr()).sort((a, b) => b.id - a.id);
@@ -1738,6 +1826,41 @@ function HomeView({ level, streak, health, flags, totalXp, activities, categoryL
           </div>
         )}
       </div>
+
+      {trial && trialStatus && (
+        <div className="nq-glass-card nq-float-trial">
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline" }}>
+            <span className="nq-eyebrow" style={{ fontSize: 10 }}>{TRIAL_NAMES[trial.category]}</span>
+            {!trialStatus.expired && (
+              <span className="nq-note" style={{ fontSize: 10 }}>{trialStatus.daysLeft}d left</span>
+            )}
+          </div>
+          {trialStatus.expired ? (
+            <>
+              <p className="nq-note" style={{ fontSize: 11, marginTop: 4 }}>
+                Time's up on this one — no harm done. A new Trial unlocks at your next milestone.
+              </p>
+              <button className="nq-btn" style={{ width: "100%", marginTop: 8, padding: "8px 10px", fontSize: 12 }} onClick={onDismissTrial}>
+                Got it
+              </button>
+            </>
+          ) : (
+            <>
+              <div className="nq-note nq-num" style={{ fontSize: 10, marginTop: 4 }}>
+                {Math.min(trialStatus.progress, trial.target)}/{trial.target} {CATEGORIES[trial.category].stat} XP
+              </div>
+              <div className="nq-track" style={{ height: 6, marginTop: 3 }}>
+                <i style={{ width: `${Math.min(100, (trialStatus.progress / trial.target) * 100)}%`, background: "var(--coin)" }} />
+              </div>
+              {trialStatus.ready && (
+                <button className="nq-btn" data-primary="1" style={{ width: "100%", marginTop: 8, padding: "8px 10px", fontSize: 12 }} onClick={onClaimTrial}>
+                  Claim reward!
+                </button>
+              )}
+            </>
+          )}
+        </div>
+      )}
 
       {(fabOpen || historyOpen) && (
         <div
