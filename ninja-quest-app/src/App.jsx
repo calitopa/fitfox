@@ -1626,35 +1626,80 @@ function EffortPickerRow({ value, onChange, labels }) {
 function SignInScreen() {
   const [email, setEmail] = useState("");
   const [sent, setSent] = useState(false);
+  const [code, setCode] = useState("");
   const [error, setError] = useState("");
   const [sending, setSending] = useState(false);
+  const [verifying, setVerifying] = useState(false);
 
-  const sendLink = async () => {
+  const sendCode = async () => {
     if (!email.trim()) return;
     setSending(true);
     setError("");
+    // No emailRedirectTo: this sends a 6-digit code instead of a clickable link.
+    // A clickable link opens in the phone's default browser (Chrome/Safari), which is a
+    // separate, isolated window from an installed PWA — so the PWA never sees the signed-in
+    // session. A code the user types back in avoids ever leaving the app.
     const { error } = await supabase.auth.signInWithOtp({
       email: email.trim(),
-      options: { emailRedirectTo: window.location.origin },
     });
     setSending(false);
     if (error) setError(error.message);
     else setSent(true);
   };
 
+  const verifyCode = async () => {
+    if (!code.trim()) return;
+    setVerifying(true);
+    setError("");
+    const { error } = await supabase.auth.verifyOtp({
+      email: email.trim(),
+      token: code.trim(),
+      type: "email",
+    });
+    setVerifying(false);
+    if (error) setError(error.message);
+    // On success, the onAuthStateChange listener elsewhere picks up the new session automatically.
+  };
+
   return (
     <div className="nq-card" style={{ marginTop: 18 }}>
       <div className="nq-disp" style={{ fontSize: 20, marginBottom: 6 }}>Welcome, ninja</div>
       {sent ? (
-        <p className="nq-note" style={{ lineHeight: 1.5 }}>
-          Check <strong>{email}</strong> for a sign-in link. Tap it on this device to jump back in — your
-          progress will be waiting for you here and on any device you sign into.
-        </p>
+        <>
+          <p className="nq-note" style={{ marginBottom: 14, lineHeight: 1.5 }}>
+            We sent a 6-digit code to <strong>{email}</strong>. Enter it below to jump back in — your
+            progress will be waiting for you here and on any device you sign into.
+          </p>
+          <label className="nq-field">
+            <span className="nq-label">Code</span>
+            <input
+              className="nq-input"
+              type="text"
+              inputMode="numeric"
+              autoComplete="one-time-code"
+              value={code}
+              onChange={(e) => setCode(e.target.value)}
+              placeholder="123456"
+              onKeyDown={(e) => e.key === "Enter" && verifyCode()}
+            />
+          </label>
+          {error && <p className="nq-note" style={{ color: "var(--berry)", marginBottom: 10 }}>{error}</p>}
+          <button className="nq-btn" data-primary="1" onClick={verifyCode} disabled={!code.trim() || verifying} style={{ width: "100%" }}>
+            {verifying ? "Checking…" : "Verify code"}
+          </button>
+          <button
+            className="nq-btn"
+            onClick={() => { setSent(false); setCode(""); setError(""); }}
+            style={{ width: "100%", marginTop: 8 }}
+          >
+            Use a different email
+          </button>
+        </>
       ) : (
         <>
           <p className="nq-note" style={{ marginBottom: 14, lineHeight: 1.5 }}>
-            Enter your email and we'll send a link — no password to remember. Your progress saves to your
-            account, not just this browser.
+            Enter your email and we'll send you a sign-in code — no password to remember. Your progress
+            saves to your account, not just this browser.
           </p>
           <label className="nq-field">
             <span className="nq-label">Email</span>
@@ -1664,12 +1709,12 @@ function SignInScreen() {
               value={email}
               onChange={(e) => setEmail(e.target.value)}
               placeholder="you@example.com"
-              onKeyDown={(e) => e.key === "Enter" && sendLink()}
+              onKeyDown={(e) => e.key === "Enter" && sendCode()}
             />
           </label>
           {error && <p className="nq-note" style={{ color: "var(--berry)", marginBottom: 10 }}>{error}</p>}
-          <button className="nq-btn" data-primary="1" onClick={sendLink} disabled={!email.trim() || sending} style={{ width: "100%" }}>
-            {sending ? "Sending…" : "Send sign-in link"}
+          <button className="nq-btn" data-primary="1" onClick={sendCode} disabled={!email.trim() || sending} style={{ width: "100%" }}>
+            {sending ? "Sending…" : "Send sign-in code"}
           </button>
         </>
       )}
